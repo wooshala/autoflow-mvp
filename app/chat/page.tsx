@@ -13,6 +13,20 @@ function sortMessagesAsc(items: ChatMessage[]): ChatMessage[] {
   return [...items].sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
 }
 
+function mergeMessages(prev: ChatMessage[], next: ChatMessage[]): ChatMessage[] {
+  const map = new Map<string, ChatMessage>();
+
+  [...prev, ...next].forEach((m) => {
+    if (m && m.id != null && String(m.id) !== '') {
+      map.set(String(m.id), m);
+    }
+  });
+
+  return Array.from(map.values()).sort((a, b) =>
+    String(a.created_at).localeCompare(String(b.created_at))
+  );
+}
+
 function maxCreatedAt(msgs: ChatMessage[]): string | null {
   if (!msgs?.length) return null;
   let max = '';
@@ -124,10 +138,32 @@ export default function ChatPage() {
       params.set('limit', opts?.since ? '40' : '50');
       if (opts?.since) params.set('since', opts.since);
       const listUrl = `${CHAT_LIST_URL}?${params.toString()}`;
+      if (opts?.since) {
+        console.log('[SINCE_CHECK]', {
+          since: opts.since,
+          now: new Date().toISOString(),
+          latestMessageCreatedAt:
+            messages && messages.length ? messages[messages.length - 1]?.created_at : null
+        });
+      }
       const res = await fetch(listUrl, {
         cache: 'no-store',
         signal: controller.signal
       });
+
+      if (source === 'initial') {
+        console.log('[INITIAL_LIST_CACHE_SW]', {
+          listUrl,
+          fetch_cache: 'no-store',
+          res_status: res.status,
+          cache_control: res.headers.get('cache-control'),
+          age: res.headers.get('age'),
+          etag: res.headers.get('etag'),
+          cf_cache_status: res.headers.get('cf-cache-status'),
+          sw_controller:
+            typeof navigator !== 'undefined' ? Boolean(navigator.serviceWorker?.controller) : null
+        });
+      }
 
       if (!res.ok) {
         throw new Error(`CHAT_LIST_HTTP_${res.status}`);
@@ -135,20 +171,27 @@ export default function ChatPage() {
 
       const data = await res.json();
       const nextMessages = Array.isArray(data?.messages) ? data.messages : null;
+      if (source === 'initial') {
+        const list = nextMessages;
+        console.log('[INITIAL_LIST_RESULT]', {
+          count: Array.isArray(list) ? list.length : null,
+          firstId: Array.isArray(list) && list.length ? list[0]?.id : null,
+          lastId: Array.isArray(list) && list.length ? list[list.length - 1]?.id : null,
+          react_state_messages_len_before_set: Array.isArray(messages) ? messages.length : null,
+          note: 'count_first_last_from_api_messages_array'
+        });
+      }
       if (!controller.signal.aborted && isMountedRef.current) {
         if (nextMessages) {
           setMessages((prev) => {
-            const byId = new Map<string, ChatMessage>();
-            prev.forEach((m) => {
-              if (!m?.id) return;
-              byId.set(String(m.id), m);
-            });
-            nextMessages.forEach((m: ChatMessage) => {
-              if (!m?.id) return;
-              const prevRow = byId.get(String(m.id));
-              byId.set(String(m.id), prevRow ? { ...prevRow, ...m } : m);
-            });
-            const merged = sortMessagesAsc(Array.from(byId.values()));
+            if (source === 'initial') {
+              console.log('[INITIAL_SET_MESSAGES_MODE]', {
+                mode: 'merge',
+                via: 'mergeMessages(prev, nextMessages)',
+                prev_count: prev.length
+              });
+            }
+            const merged = mergeMessages(prev, nextMessages);
             console.log('[SET_MESSAGES_MERGED_LAST_IDS]', {
               source,
               before_count: prev.length,
@@ -246,32 +289,42 @@ export default function ChatPage() {
         had_existing_in_prev: idx !== -1,
         merge_index: idx === -1 ? null : idx
       });
+      const rowFull = { ...row, id } as ChatMessage;
+      const toMerge = idx === -1 ? rowFull : ({ ...prev[idx], ...row, id } as ChatMessage);
+      const next = mergeMessages(prev, [toMerge]);
       if (idx === -1) {
-        const next = sortMessagesAsc([...prev, { ...row, id } as ChatMessage]);
         console.log('[SET_MESSAGES_COUNT]', {
           source: 'realtime_upsert_insert',
           prev_count: prev.length,
           next_count: next.length
         });
-        return next;
+      } else {
+        console.log('[REALTIME_DEDUPE_HIT]', {
+          message_id: id,
+          index: idx
+        });
+        console.log('[SET_MESSAGES_COUNT]', {
+          source: 'realtime_upsert_update',
+          prev_count: prev.length,
+          next_count: next.length
+        });
       }
-      const next = [...prev];
-      next[idx] = { ...next[idx], ...row, id };
-      console.log('[REALTIME_DEDUPE_HIT]', {
-        message_id: id,
-        index: idx
-      });
-      console.log('[SET_MESSAGES_COUNT]', {
-        source: 'realtime_upsert_update',
-        prev_count: prev.length,
-        next_count: next.length
-      });
       return next;
     });
   }
 
   useEffect(() => {
     isMountedRef.current = true;
+    if (typeof window !== 'undefined') {
+      const nav = performance.getEntriesByType('navigation')[0] as PerformanceNavigationTiming | undefined;
+      console.log('[CHAT_DOCUMENT_MOUNT]', {
+        href: window.location.href,
+        sw_controller: Boolean(navigator.serviceWorker?.controller),
+        navigation_transferSize: nav?.transferSize ?? null,
+        navigation_type: nav?.type ?? null,
+        note: 'document_load_hint_not_same_as_api_json_cache'
+      });
+    }
     void load('initial');
     return () => {
       isMountedRef.current = false;
@@ -318,7 +371,6 @@ export default function ChatPage() {
       if (!isMountedRef.current) return;
       if (document.hidden) {
         console.log('[POLLING_SKIPPED]', { reason: 'hidden_tab' });
-        return;
       }
       const connected = realtimeConnectedRef.current;
       const pushEver = lastRealtimeInsertPushAtRef.current != null;
@@ -500,7 +552,7 @@ export default function ChatPage() {
       ai_action: null,
       created_at: new Date().toISOString()
     };
-    setMessages((prev) => [...prev, optimisticMessage]);
+    setMessages((prev) => mergeMessages(prev, [optimisticMessage]));
     try {
       const clientRequestId = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`).toString();
       const deviceId = getOrCreateDeviceId();
@@ -525,22 +577,33 @@ export default function ChatPage() {
         body: fd
       });
 
-const data = await res.json();
+      const data = await res.json();
 
-if (!res.ok) {
-  console.error('[CHAT_SEND_CLIENT_ERROR]', data);
-  alert(data?.error || '채팅 전송 실패');
-  return;
-}
+      if (!res.ok) {
+        console.error('[CHAT_SEND_CLIENT_ERROR]', data);
+        alert(data?.error || '채팅 전송 실패');
+        return;
+      }
 
-if (!data?.message) {
-  alert('채팅 응답이 비정상입니다.');
-  return;
-}
+      if (!data?.message) {
+        alert('채팅 응답이 비정상입니다.');
+        return;
+      }
 
-console.log('[SEND_RESPONSE_OK]', { message_id: data?.message?.id || null, ai_action: data?.message?.ai_action || null, ticket_id: data?.message?.ticket_id || null });
-setMessages((prev) => prev.map((m) => (m.id === optimisticId ? ({ ...m, ...data.message } as ChatMessage) : m)));
-clearInput();
+      console.log('[SEND_RESPONSE_OK]', {
+        message_id: data?.message?.id || null,
+        ai_action: data?.message?.ai_action || null,
+        ticket_id: data?.message?.ticket_id || null
+      });
+      setMessages((prev) => {
+        const opt = prev.find((m) => m.id === optimisticId);
+        const mergedMsg = opt
+          ? ({ ...opt, ...data.message } as ChatMessage)
+          : (data.message as ChatMessage);
+        const base = prev.filter((m) => m.id !== optimisticId);
+        return mergeMessages(base, [mergedMsg]);
+      });
+      clearInput();
     } catch (error: any) {
       console.error('[CHAT_SEND_CLIENT_ERROR]', {
         error: error?.message || String(error)
@@ -628,9 +691,18 @@ resetComposer();
       source: 'manual_ticket_link',
       message_id: msg.id
     });
-    setMessages((prev) =>
-      prev.map((m) => (m.id === msg.id ? { ...m, ticket_id: createdData.ticket.id, room_no: roomNo, ai_action: linked?.message?.ai_action || 'ticket_created_manual' } : m))
-    );
+    setMessages((prev) => {
+      const existing = prev.find((m) => m.id === msg.id);
+      if (!existing) return prev;
+      return mergeMessages(prev, [
+        {
+          ...existing,
+          ticket_id: createdData.ticket.id,
+          room_no: roomNo,
+          ai_action: linked?.message?.ai_action || 'ticket_created_manual'
+        }
+      ]);
+    });
   }
 
   function clearInput() {
@@ -680,15 +752,19 @@ resetComposer();
       }
       const updated = data?.message as ChatMessage | undefined;
       if (updated?.id) {
-        setMessages((prev) => prev.map((m) => (String(m.id) === String(updated.id) ? { ...m, ...updated } : m)));
+        setMessages((prev) => {
+          const existing = prev.find((m) => String(m.id) === String(updated.id));
+          const row = existing ? ({ ...existing, ...updated } as ChatMessage) : updated;
+          return mergeMessages(prev, [row]);
+        });
       } else {
-        setMessages((prev) =>
-          prev.map((m) =>
-            String(m.id) === String(msg.id)
-              ? { ...m, is_deleted: true, deleted_at: new Date().toISOString() }
-              : m
-          )
-        );
+        setMessages((prev) => {
+          const existing = prev.find((m) => String(m.id) === String(msg.id));
+          if (!existing) return prev;
+          return mergeMessages(prev, [
+            { ...existing, is_deleted: true, deleted_at: new Date().toISOString() }
+          ]);
+        });
       }
     } catch (e: any) {
       console.error('[CHAT_DELETE_CLIENT_ERROR]', e);
@@ -697,6 +773,15 @@ resetComposer();
       setDeletingMessageId(null);
     }
   }
+
+  const messagesForRender = useMemo(
+    () =>
+      messages.filter(
+        (m): m is ChatMessage =>
+          Boolean(m) && m.user_id != null && String(m.user_id).trim() !== ''
+      ),
+    [messages]
+  );
 
   return (
     <main className="flex h-screen flex-col bg-gray-100">
@@ -723,7 +808,7 @@ resetComposer();
 
       <section className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
         <ChatMessages
-          messages={messages}
+          messages={messagesForRender}
           currentUserId={user?.id || null}
           deletingMessageId={deletingMessageId}
           onDeleteMessage={handleDeleteMessage}
